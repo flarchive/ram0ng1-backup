@@ -1,0 +1,608 @@
+import app from 'flarum/admin/app';
+import Modal, { IInternalModalAttrs } from 'flarum/common/components/Modal';
+import Button from 'flarum/common/components/Button';
+import LoadingIndicator from 'flarum/common/components/LoadingIndicator';
+
+import { apiUrl, fmtBytes } from '../utils/api';
+
+export interface ImportModalAttrs extends IInternalModalAttrs {
+  onComplete: () => void;
+}
+
+interface ArchiveExtensionEntry {
+  id: string;
+  name?: string;
+  title?: string;
+  version?: string;
+  location?: 'workbench' | 'vendor' | 'unknown';
+  relative?: string;
+  files?: number;
+}
+
+interface ArchiveManifest {
+  asset_count?: number;
+  storage_count?: number;
+  extension_count?: number;
+  // Older archives shipped extensions as a flat string[] of dirnames.
+  // New archives ship rich descriptors.
+  extensions?: string[] | ArchiveExtensionEntry[];
+  has_composer?: boolean;
+}
+
+interface InspectResult {
+  job_id: string;
+  is_encrypted: boolean;
+  meta: {
+    format_version?: number;
+    created_at?: string;
+    flarum_version?: string;
+    php_version?: string;
+    contents?: string[];
+    source_url?: string;
+    manifest?: ArchiveManifest;
+  };
+  size: number;
+}
+
+interface ImportProgress {
+  phase: 'inspect' | 'extract' | 'restore' | 'rewrite' | 'finalize' | 'done' | 'error';
+  message: string;
+  progress: {
+    total_bytes: number;
+    processed_bytes: number;
+    extracted_entries: number;
+    restored_statements: number;
+    percent: number;
+  };
+}
+
+const trans = (key: string, params?: Record<string, unknown>) =>
+  app.translator.trans(`ramon-backup.admin.import_modal.${key}`, params ?? {});
+
+/**
+ * Three-stage modal:
+ *   1. upload   — operator picks a `.flarum` file. We POST to /imports
+ *                  and the server validates the header without
+ *                  decrypting.
+ *   2. configure — depending on the inspect result we ask for the
+ *                  private key (only when the archive is encrypted)
+ *                  AND a confirm-replace checkbox in all cases. The
+ *                  user agreed in setup that we'd ask at this point.
+ *   3. progress — chunked-tick polling drives a progress bar.
+ */
+export default class ImportModal extends Modal<ImportModalAttrs> {
+  protected stage: 'upload' | 'configure' | 'progress' = 'upload';
+
+  protected file: File | null = null;
+  protected uploading = false;
+  protected uploadProgress = 0;
+  protected uploadIndeterminate = false;
+  protected uploadError: string | null = null;
+
+  protected inspect: InspectResult | null = null;
+  protected privateKey = '';
+  protected confirmReplace = false;
+  protected starting = false;
+
+  // Section toggles. Default to "everything that's actually inside the
+  // archive" — the user explicitly opts OUT of pieces they don't want
+  // to overwrite. Initialised when the inspect result arrives.
+  protected sectionDb = false;
+  protected sectionAssets = false;
+  protected sectionStorage = false;
+  protected sectionExtensions = false;
+  // Per-extension toggles, keyed by directory name from the manifest.
+  protected extensionsByName: Record<string, boolean> = {};
+
+  protected status: ImportProgress | null = null;
+  protected polling = false;
+
+  className() {
+    return 'BackupImportModal Modal--medium';
+  }
+
+  title() {
+    return trans('title');
+  }
+
+  content() {
+    if (this.stage === 'upload') return this.uploadContent();
+    if (this.stage === 'configure') return this.configureContent();
+    return this.progressContent();
+  }
+
+  // ────────────────────────────────────────── upload stage
+
+  uploadContent() {
+    return (
+      <div className="Modal-body">
+        <div className="Alert Alert--warning">
+          <strong>{trans('warning_title')}</strong>
+          <p>{trans('warning_body')}</p>
+        </div>
+
+        <label className="BackupImport-fileLabel">
+          <input
+            type="file"
+            accept=".flarum"
+            onchange={(e: Event) => {
+              const f = (e.target as HTMLInputElement).files?.[0] || null;
+              this.file = f;
+            }}
+          />
+          {this.file ? (
+            <span>
+              {this.file.name} <span className="helpText">({fmtBytes(this.file.size)})</span>
+            </span>
+          ) : (
+            <span className="helpText">{trans('choose_file')}</span>
+          )}
+        </label>
+
+        {this.uploadError && <div className="Alert Alert--error">{this.uploadError}</div>}
+
+        {this.uploading && (
+          <div className="BackupImport-uploadProgress">
+            <div className="BackupImport-bar">
+              <div
+                className={
+                  'BackupImport-bar-fill' +
+                  (this.uploadIndeterminate ? ' BackupImport-bar-fill--indeterminate' : '')
+                }
+                style={
+                  this.uploadIndeterminate
+                    ? undefined
+                    : { width: `${Math.max(2, this.uploadProgress)}%` }
+                }
+              />
+            </div>
+            <div className="BackupImport-uploadStatus helpText">
+              {this.uploadIndeterminate
+                ? trans('inspecting_archive')
+                : trans('uploading_pct', { pct: this.uploadProgress })}
+            </div>
+          </div>
+        )}
+
+        <div className="Form-group">
+          <Button
+            className="Button Button--primary"
+            loading={this.uploading}
+            disabled={this.uploading || !this.file}
+            onclick={() => this.upload()}
+          >
+            {trans('upload_button')}
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  async upload() {
+    if (!this.file) return;
+    this.uploading = true;
+    this.uploadProgress = 0;
+    this.uploadIndeterminate = false;
+    this.uploadError = null;
+
+    try {
+      // Use a raw XHR so we can show upload progress — Flarum's
+      // app.request (mithril's m.request) does not expose
+      // `xhr.upload.onprogress`. Once 100% has been sent the server
+      // still has to read the header + validate the archive, so we
+      // flip to an indeterminate "Inspecting…" state until the
+      // response comes back.
+      const res = await this.uploadWithProgress(this.file, (pct) => {
+        this.uploadProgress = pct;
+        if (pct >= 100) this.uploadIndeterminate = true;
+        m.redraw();
+      });
+      this.inspect = res;
+
+      // Seed section toggles from what the archive actually contains.
+      // Anything missing from the archive can't be ticked anyway, so
+      // there's no value in defaulting it to true.
+      const contents = res.meta.contents || [];
+      this.sectionDb = contents.includes('db');
+      this.sectionAssets = contents.includes('assets');
+      this.sectionStorage = contents.includes('storage');
+      this.sectionExtensions = contents.includes('extensions');
+
+      // Normalise to {id} regardless of which manifest version the
+      // archive was packed with (string[] vs ArchiveExtensionEntry[]).
+      const exts = res.meta.manifest?.extensions || [];
+      this.extensionsByName = {};
+      for (const e of exts) {
+        const id = typeof e === 'string' ? e : e.id;
+        if (id) this.extensionsByName[id] = true;
+      }
+
+      this.stage = 'configure';
+    } catch (e: any) {
+      this.uploadError = e?.detail || (trans('upload_failed') as string);
+    } finally {
+      this.uploading = false;
+      m.redraw();
+    }
+  }
+
+  /**
+   * XHR-based upload with progress reporting. Flarum's session is
+   * cookie-based, so credentials carry automatically; we just need to
+   * forward the CSRF token the same way app.request does.
+   */
+  private uploadWithProgress(file: File, onProgress: (pct: number) => void): Promise<InspectResult> {
+    return new Promise<InspectResult>((resolve, reject) => {
+      const fd = new FormData();
+      fd.append('archive', file);
+
+      const xhr = new XMLHttpRequest();
+      xhr.upload.addEventListener('progress', (e: ProgressEvent) => {
+        if (e.lengthComputable) {
+          onProgress(Math.round((e.loaded / Math.max(e.total, 1)) * 100));
+        }
+      });
+      xhr.upload.addEventListener('load', () => onProgress(100));
+
+      xhr.addEventListener('load', () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            resolve(JSON.parse(xhr.responseText) as InspectResult);
+          } catch {
+            reject({ detail: trans('upload_failed') as string });
+          }
+        } else {
+          let detail: string | undefined;
+          try {
+            const body = JSON.parse(xhr.responseText);
+            detail = body?.errors?.[0]?.detail;
+          } catch {
+            // non-JSON error body — fall back to status text
+          }
+          reject({ detail: detail || `${xhr.status} ${xhr.statusText}` });
+        }
+      });
+      xhr.addEventListener('error', () => reject({ detail: trans('upload_failed') as string }));
+      xhr.addEventListener('abort', () => reject({ detail: 'aborted' }));
+
+      xhr.open('POST', `${apiUrl()}/backup/imports`, true);
+      xhr.withCredentials = true;
+      // CSRF token — Flarum exposes it on the `app.session`.
+      const csrf = (app as any).session?.csrfToken;
+      if (csrf) xhr.setRequestHeader('X-CSRF-Token', csrf);
+      xhr.send(fd);
+    });
+  }
+
+  // ────────────────────────────────────────── configure stage
+
+  configureContent() {
+    const i = this.inspect!;
+    return (
+      <div className="Modal-body">
+        <h4>{trans('inspect_title')}</h4>
+        <dl className="BackupImport-meta">
+          {i.meta.created_at && (
+            <>
+              <dt>{trans('meta_when')}</dt>
+              <dd>{i.meta.created_at}</dd>
+            </>
+          )}
+          {i.meta.flarum_version && (
+            <>
+              <dt>{trans('meta_flarum')}</dt>
+              <dd>{i.meta.flarum_version}</dd>
+            </>
+          )}
+          {i.meta.contents && (
+            <>
+              <dt>{trans('meta_contents')}</dt>
+              <dd>{i.meta.contents.join(', ')}</dd>
+            </>
+          )}
+          {i.meta.source_url && (
+            <>
+              <dt>{trans('meta_source_url')}</dt>
+              <dd>
+                <code>{i.meta.source_url}</code>
+              </dd>
+            </>
+          )}
+          <dt>{trans('meta_size')}</dt>
+          <dd>{fmtBytes(i.size)}</dd>
+        </dl>
+
+        <div className="Alert Alert--info BackupImport-urlNote">
+          <i className="icon fas fa-info-circle" /> {trans('url_rewrite_note')}
+        </div>
+
+        {this.selectionFieldset(i)}
+
+        {i.is_encrypted && (
+          <fieldset className="BackupImport-fieldset">
+            <legend>{trans('key_title')}</legend>
+            <p className="helpText">{trans('key_help')}</p>
+            <textarea
+              className="FormControl BackupImport-keyInput"
+              rows={3}
+              placeholder="base64 private key"
+              value={this.privateKey}
+              oninput={(e: Event) => {
+                this.privateKey = (e.target as HTMLTextAreaElement).value;
+              }}
+            />
+            <p className="helpText BackupImport-keyHint">{trans('key_hint_local')}</p>
+          </fieldset>
+        )}
+
+        <div className="Alert Alert--error BackupImport-confirmAlert">
+          <strong>{trans('confirm_title')}</strong>
+          <p>{trans('confirm_body')}</p>
+          <label className="BackupImport-confirm">
+            <input
+              type="checkbox"
+              checked={this.confirmReplace}
+              onchange={(e: Event) => {
+                this.confirmReplace = (e.target as HTMLInputElement).checked;
+              }}
+            />{' '}
+            <span>{trans('confirm_check')}</span>
+          </label>
+        </div>
+
+        <div className="Form-group">
+          <Button
+            className="Button Button--primary"
+            loading={this.starting}
+            disabled={this.starting || !this.confirmReplace}
+            onclick={() => this.startRestore()}
+          >
+            {trans('start_button')}
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  selectionFieldset(i: InspectResult) {
+    const contents = i.meta.contents || [];
+    const manifest = i.meta.manifest || {};
+    const hasDb = contents.includes('db');
+    const hasAssets = contents.includes('assets');
+    const hasStorage = contents.includes('storage');
+    const hasExtensions = contents.includes('extensions');
+    const rawExtList = manifest.extensions || [];
+    // Normalise to a uniform shape so the renderer can stay simple,
+    // regardless of which manifest version the archive used.
+    const extList: ArchiveExtensionEntry[] = (rawExtList as Array<string | ArchiveExtensionEntry>).map((e) =>
+      typeof e === 'string' ? { id: e, location: 'workbench' as const } : e
+    );
+
+    return (
+      <fieldset className="BackupImport-fieldset">
+        <legend>{trans('selection_title')}</legend>
+        <p className="helpText">{trans('selection_help')}</p>
+
+        {hasDb && this.sectionRow('db', this.sectionDb, (v) => (this.sectionDb = v))}
+        {hasAssets && this.sectionRow('assets', this.sectionAssets, (v) => (this.sectionAssets = v), manifest.asset_count)}
+        {hasStorage && this.sectionRow('storage', this.sectionStorage, (v) => (this.sectionStorage = v), manifest.storage_count)}
+        {hasExtensions && (
+          <>
+            {this.sectionRow('extensions', this.sectionExtensions, (v) => {
+              this.sectionExtensions = v;
+              // Cascade: turning the section off / on flips every
+              // child to match. The user can then untick individuals.
+              for (const name of extList) this.extensionsByName[name] = v;
+            }, manifest.extension_count)}
+
+            {this.sectionExtensions && manifest.has_composer && (
+              <div className="BackupImport-composerNote helpText">
+                <i className="icon fas fa-cube" /> {trans('extensions_composer_note')}
+              </div>
+            )}
+
+            {this.sectionExtensions && extList.length > 0 && (
+              <div className="BackupImport-extList">
+                {extList.map((ext) => (
+                  <label className="BackupImport-extRow" key={ext.id}>
+                    <input
+                      type="checkbox"
+                      checked={!!this.extensionsByName[ext.id]}
+                      onchange={(e: Event) => {
+                        this.extensionsByName[ext.id] = (e.target as HTMLInputElement).checked;
+                      }}
+                    />{' '}
+                    <span className="BackupImport-extTitle">{ext.title || ext.id}</span>{' '}
+                    {ext.name && ext.name !== ext.id && (
+                      <code className="BackupImport-extName">{ext.name}</code>
+                    )}
+                    {ext.location && (
+                      <span className={`BackupImport-extTag BackupImport-extTag--${ext.location}`}>
+                        {trans('extensions_tag_' + ext.location)}
+                      </span>
+                    )}
+                  </label>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+      </fieldset>
+    );
+  }
+
+  sectionRow(key: 'db' | 'assets' | 'storage' | 'extensions', checked: boolean, set: (v: boolean) => void, count?: number) {
+    return (
+      <label className="BackupImport-sectionRow">
+        <input
+          type="checkbox"
+          checked={checked}
+          onchange={(e: Event) => set((e.target as HTMLInputElement).checked)}
+        />{' '}
+        <span className="BackupImport-sectionLabel">{trans('section_' + key)}</span>
+        {count !== undefined && count > 0 && (
+          <span className="BackupImport-sectionCount helpText">
+            {' '}
+            ({trans('section_count', { count })})
+          </span>
+        )}
+      </label>
+    );
+  }
+
+  buildSelection() {
+    // The backend treats `extensions: true` as "all" and an array as
+    // a whitelist of directory names. When every box is checked, send
+    // `true` so the user's intent isn't lost if a new extension shows
+    // up between inspect and apply (it shouldn't, but be defensive).
+    const extEntries = Object.entries(this.extensionsByName);
+    const allChecked = extEntries.length > 0 && extEntries.every(([, v]) => v);
+    const extensionsField: boolean | string[] = !this.sectionExtensions
+      ? false
+      : allChecked
+        ? true
+        : extEntries.filter(([, v]) => v).map(([k]) => k);
+
+    return {
+      db: this.sectionDb,
+      assets: this.sectionAssets,
+      storage: this.sectionStorage,
+      extensions: extensionsField,
+    };
+  }
+
+  async startRestore() {
+    if (!this.inspect) return;
+    this.starting = true;
+
+    try {
+      const res = await app.request<{ phase: string; message: string }>({
+        method: 'POST',
+        url: `${apiUrl()}/backup/imports/${this.inspect.job_id}/start`,
+        body: {
+          private_key: this.privateKey.trim() || null,
+          confirm_replace: this.confirmReplace,
+          selection: this.buildSelection(),
+        },
+      });
+      this.stage = 'progress';
+      this.status = {
+        phase: res.phase as ImportProgress['phase'],
+        message: res.message,
+        progress: {
+          total_bytes: this.inspect.size,
+          processed_bytes: 0,
+          extracted_entries: 0,
+          restored_statements: 0,
+          percent: 0,
+        },
+      };
+      m.redraw();
+      this.pump();
+    } catch (e: any) {
+      const msg = e?.response?.errors?.[0]?.detail || (trans('start_failed') as string);
+      app.alerts.show({ type: 'error' }, msg);
+    } finally {
+      this.starting = false;
+    }
+  }
+
+  // ────────────────────────────────────────── progress stage
+
+  progressContent() {
+    const s = this.status;
+    if (!s) return <LoadingIndicator />;
+
+    const isDone = s.phase === 'done';
+    const isError = s.phase === 'error';
+    const pct = Math.max(0, Math.min(100, s.progress?.percent || 0));
+
+    return (
+      <div className="Modal-body BackupImport-progress">
+        <div className={`BackupImport-status BackupImport-status--${s.phase}`}>
+          <strong>{trans('phase_' + s.phase)}</strong>
+          <p>{s.message}</p>
+        </div>
+
+        {!isError && (
+          <div className="BackupImport-bar">
+            <div className="BackupImport-bar-fill" style={{ width: `${isDone ? 100 : pct}%` }} />
+          </div>
+        )}
+
+        {isDone && this.sectionDb && (
+          <div className="Alert Alert--info BackupImport-reloadNote">
+            <i className="icon fas fa-info-circle" /> {trans('reload_required')}
+          </div>
+        )}
+
+        <div className="Form-group BackupImport-progress-actions">
+          {!isDone && !isError && (
+            <Button className="Button" onclick={() => this.cancel()}>
+              {trans('cancel_button')}
+            </Button>
+          )}
+          {isError && (
+            <Button className="Button Button--primary" onclick={() => this.close()}>
+              {trans('close_button')}
+            </Button>
+          )}
+          {isDone && (
+            <Button
+              className="Button Button--primary"
+              icon="fas fa-rotate"
+              onclick={() => window.location.reload()}
+            >
+              {trans('reload_button')}
+            </Button>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  async pump() {
+    if (this.polling || !this.inspect) return;
+    this.polling = true;
+
+    try {
+      while (this.inspect && this.status && this.status.phase !== 'done' && this.status.phase !== 'error') {
+        const res = await app.request<ImportProgress>({
+          method: 'POST',
+          url: `${apiUrl()}/backup/imports/${this.inspect.job_id}/tick`,
+        });
+        this.status = res;
+        m.redraw();
+      }
+      if (this.status?.phase === 'done') {
+        // Don't refresh the parent panel — when the backup includes
+        // the database, restoring it has just replaced the sessions
+        // table this admin is authenticated against. Any further API
+        // call from this stale session would fail (401 / CSRF) and
+        // surface as a confusing "Oops!" toast. The user clicks
+        // Reload below and gets a clean session.
+        app.alerts.show({ type: 'success' }, trans('completed'));
+        if (!this.sectionDb) this.attrs.onComplete();
+      }
+    } finally {
+      this.polling = false;
+    }
+  }
+
+  async cancel() {
+    if (!this.inspect) return;
+    try {
+      await app.request({
+        method: 'DELETE',
+        url: `${apiUrl()}/backup/imports/${this.inspect.job_id}`,
+      });
+    } catch {
+      /* best effort */
+    }
+    this.close();
+  }
+
+  close() {
+    this.hide();
+  }
+}
