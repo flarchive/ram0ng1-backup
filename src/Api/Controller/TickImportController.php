@@ -1,0 +1,74 @@
+<?php
+
+/*
+ * This file is part of ramon/backup.
+ *
+ * Copyright (c) 2026 Ramon Guilherme.
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Ramon\Backup\Api\Controller;
+
+use Flarum\Foundation\ValidationException;
+use Laminas\Diactoros\Response\JsonResponse;
+use Psr\Http\Message\ResponseInterface;
+use Psr\Http\Message\ServerRequestInterface;
+use Psr\Http\Server\RequestHandlerInterface;
+use Ramon\Backup\Job\ImportJob;
+use Ramon\Backup\Job\JobState;
+use Ramon\Backup\Locale\Messages;
+use Ramon\Backup\StoragePaths;
+
+/**
+ * POST /api/backup/imports/{id}/tick
+ *
+ * Avança a restauração um tick, como o tick da exportação.
+ */
+class TickImportController implements RequestHandlerInterface
+{
+    use AdminOnlyController;
+
+    public function __construct(
+        protected ImportJob $job,
+        protected StoragePaths $paths,
+        protected Messages $messages
+    ) {
+    }
+
+    public function handle(ServerRequestInterface $request): ResponseInterface
+    {
+        $this->assertAdmin($request);
+
+        $id = (string) ($request->getQueryParams()['id'] ?? '');
+        if (! preg_match('/^[a-f0-9]{16}$/', $id)) {
+            throw new ValidationException(['id' => $this->messages->get('errors.invalid_job')]);
+        }
+
+        $stateFile = $this->paths->importJobDir($id).DIRECTORY_SEPARATOR.'job.json';
+        if (! is_file($stateFile)) {
+            throw new ValidationException(['id' => $this->messages->get('errors.import_not_found')]);
+        }
+
+        // A chave privada nunca vai para o disco: o cliente a reenvia a
+        // cada tick. Ausente em arquivo sem criptografia.
+        $body = (array) $request->getParsedBody();
+        $privateKey = isset($body['private_key']) ? trim((string) $body['private_key']) : '';
+        $this->job->withPrivateKey($privateKey !== '' ? $privateKey : null);
+
+        $state = JobState::load($stateFile);
+        $this->job->runTick($state);
+
+        return new JsonResponse([
+            'phase'    => $state->get('phase'),
+            'message'  => $state->get('message'),
+            'progress' => $state->get('progress'),
+            // Restauração que perdeu entradas termina em `done`, então o
+            // frontend precisa destes dois para não pintar a tela de
+            // sucesso limpo por cima de um restore incompleto.
+            'warnings'   => $state->get('warnings', []),
+            'incomplete' => (bool) $state->get('incomplete', false),
+        ]);
+    }
+}

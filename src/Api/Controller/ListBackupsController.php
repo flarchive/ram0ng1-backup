@@ -1,0 +1,52 @@
+<?php
+
+/*
+ * This file is part of ramon/backup.
+ *
+ * Copyright (c) 2026 Ramon Guilherme.
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Ramon\Backup\Api\Controller;
+
+use Laminas\Diactoros\Response\JsonResponse;
+use Psr\Http\Message\ResponseInterface;
+use Psr\Http\Message\ServerRequestInterface;
+use Psr\Http\Server\RequestHandlerInterface;
+use Ramon\Backup\Models\Backup;
+
+/**
+ * Backups salvos, mais recentes primeiro. Sem paginação: são poucos e o
+ * painel mostra todos numa tela.
+ */
+class ListBackupsController implements RequestHandlerInterface
+{
+    use AdminOnlyController;
+
+    public function handle(ServerRequestInterface $request): ResponseInterface
+    {
+        $this->assertCanManage($request);
+
+        $rows = Backup::query()
+            ->orderBy('created_at', 'desc')
+            ->limit(500)
+            ->get();
+
+        $data = $rows->map(fn (Backup $b) => [
+            'id'             => (int) $b->id,
+            'filename'       => $b->filename,
+            'size_bytes'     => (int) $b->size_bytes,
+            'encrypted'      => (bool) $b->encrypted,
+            'contents'       => $b->contentsList(),
+            'flarum_version' => $b->flarum_version,
+            'php_version'    => $b->php_version,
+            'target_dialect' => $b->target_dialect,
+            'created_at'     => optional($b->created_at)->toIso8601String(),
+            'created_by'     => $b->created_by ? (int) $b->created_by : null,
+        ])->all();
+
+        return new JsonResponse(['backups' => $data]);
+    }
+}
