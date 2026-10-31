@@ -1,0 +1,67 @@
+<?php
+
+/*
+ * This file is part of ramon/backup.
+ *
+ * Copyright (c) 2026 Ramon Guilherme.
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Ramon\Backup\Models;
+
+use Flarum\Database\AbstractModel;
+use Flarum\User\User;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+
+/**
+ * @property int $id
+ * @property string $filename
+ * @property int $size_bytes
+ * @property bool $encrypted
+ * @property string $contents
+ * @property string|null $flarum_version
+ * @property string|null $php_version
+ * @property string|null $target_dialect
+ * @property int|null $created_by
+ * @property \Carbon\Carbon|null $created_at
+ * @property \Carbon\Carbon|null $updated_at
+ */
+class Backup extends AbstractModel
+{
+    protected $table = 'backups';
+
+    // O AbstractModel do Flarum desliga os timestamps do Eloquent.
+    public $timestamps = true;
+
+    protected $casts = [
+        'encrypted'  => 'bool',
+        'size_bytes' => 'int',
+        'created_at' => 'datetime',
+        'updated_at' => 'datetime',
+    ];
+
+    protected $fillable = [
+        'filename',
+        'size_bytes',
+        'encrypted',
+        'contents',
+        'flarum_version',
+        'php_version',
+        'target_dialect',
+        'created_by',
+    ];
+
+    public function creator(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'created_by');
+    }
+
+    /** @return list<string> */
+    public function contentsList(): array
+    {
+        $raw = trim((string) $this->contents);
+        return $raw === '' ? [] : array_values(array_filter(explode(',', $raw)));
+    }
+}

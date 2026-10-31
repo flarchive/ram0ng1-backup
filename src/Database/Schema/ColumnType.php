@@ -1,0 +1,84 @@
+<?php
+
+/*
+ * This file is part of ramon/backup.
+ *
+ * Copyright (c) 2026 Ramon Guilherme.
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Ramon\Backup\Database\Schema;
+
+/**
+ * Tipo neutro de coluna, comum a introspectors e emitters. Os nomes
+ * seguem o MySQL (o vocabulário mais amplo), com alguns extras (UUID, JSON)
+ * que mapeiam bem nos outros engines.
+ */
+enum ColumnType: string
+{
+    case BOOL       = 'bool';
+
+    case TINYINT    = 'tinyint';
+    case SMALLINT   = 'smallint';
+    case INTEGER    = 'integer';
+    case BIGINT     = 'bigint';
+
+    case DECIMAL    = 'decimal';
+    case FLOAT      = 'float';
+    case DOUBLE     = 'double';
+
+    case CHAR       = 'char';
+    case VARCHAR    = 'varchar';
+    case TEXT       = 'text';
+    case MEDIUMTEXT = 'mediumtext';
+    case LONGTEXT   = 'longtext';
+
+    case BINARY     = 'binary';
+    case VARBINARY  = 'varbinary';
+    case BLOB       = 'blob';
+    case MEDIUMBLOB = 'mediumblob';
+    case LONGBLOB   = 'longblob';
+
+    case DATE       = 'date';
+    case TIME       = 'time';
+    case DATETIME   = 'datetime';
+    case TIMESTAMP  = 'timestamp';
+
+    case JSON       = 'json';
+    case ENUM       = 'enum';
+    case UUID       = 'uuid';
+
+    public function isInteger(): bool
+    {
+        return match ($this) {
+            self::TINYINT, self::SMALLINT, self::INTEGER, self::BIGINT => true,
+            default => false,
+        };
+    }
+
+    public function isString(): bool
+    {
+        return match ($this) {
+            self::CHAR, self::VARCHAR, self::TEXT, self::MEDIUMTEXT, self::LONGTEXT, self::ENUM, self::UUID => true,
+            default => false,
+        };
+    }
+
+    public function isBinary(): bool
+    {
+        return match ($this) {
+            self::BINARY, self::VARBINARY, self::BLOB, self::MEDIUMBLOB, self::LONGBLOB => true,
+            default => false,
+        };
+    }
+
+    public function isTemporal(): bool
+    {
+        return match ($this) {
+            self::DATE, self::TIME, self::DATETIME, self::TIMESTAMP => true,
+            default => false,
+        };
+    }
+}
